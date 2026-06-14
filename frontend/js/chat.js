@@ -243,9 +243,7 @@ const Chat = {
             text,
             model,
             mode,
-            attachments.filter(a => a.type && a.type.startsWith('image/')).length > 0
-                ? attachments.filter(a => a.type && a.type.startsWith('image/'))
-                : (attachments.length > 0 ? attachments : null),
+            attachments.length > 0 ? attachments : null,
             // onText
             (chunk) => {
                 fullText += chunk;

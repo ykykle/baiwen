@@ -3,15 +3,23 @@ AI Chat Assistant - Backend Server
 FastAPI + LangChain ChatOpenAI integration with DeepSeek models.
 """
 import os
+import sys
+import io
 import json
+import time
 import base64
 import uuid
+import logging
+import traceback
 import mimetypes
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
-
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+import pdfplumber
+import pytesseract
+from PIL import Image
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +27,17 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("baiwen")
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -29,9 +48,18 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", os.getenv("ANTHROPIC_API_KEY", ""))
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 
-print(f"[启动] .env 路径: {(Path(__file__).resolve().parent / '.env')}")
-print(f"[启动] API Key 已加载: {bool(DEEPSEEK_API_KEY)} (长度: {len(DEEPSEEK_API_KEY)})")
-print(f"[启动] API Base URL: {DEEPSEEK_BASE_URL}")
+# 配置 Tesseract OCR 路径（pytesseract 默认查 PATH，Windows 常需手动指定）
+_TESSERACT_DIR = os.getenv("TESSERACT_DIR", r"D:\Program Files\Tesseract-OCR")
+_TESSERACT_EXE = os.path.join(_TESSERACT_DIR, "tesseract.exe")
+if os.path.exists(_TESSERACT_EXE):
+    pytesseract.pytesseract.tesseract_cmd = _TESSERACT_EXE
+    logger.info("Tesseract OCR: %s", _TESSERACT_EXE)
+else:
+    logger.warning("Tesseract OCR 未找到: %s（图片 OCR 将不可用）", _TESSERACT_EXE)
+
+logger.info(".env path: %s", (Path(__file__).resolve().parent / ".env"))
+logger.info("API Key loaded: %s (length: %d)", bool(DEEPSEEK_API_KEY), len(DEEPSEEK_API_KEY))
+logger.info("API Base URL: %s", DEEPSEEK_BASE_URL)
 
 DEFAULT_MODEL = "deepseek-v4-flash"
 AVAILABLE_MODELS = {
@@ -63,10 +91,92 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log every HTTP request with method, path, status, and latency."""
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed = (time.perf_counter() - start) * 1000
+    logger.info(
+        "%s %s → %d (%.1fms)",
+        request.method, request.url.path, response.status_code, elapsed,
+    )
+    return response
+
+
 # ---------------------------------------------------------------------------
-# In-Memory Store
+# Persistent Conversation Store (JSON file)
 # ---------------------------------------------------------------------------
-conversations: dict = {}
+DATA_DIR = Path(__file__).resolve().parent / "data"
+DATA_FILE = DATA_DIR / "conversations.json"
+
+
+class ConversationStore:
+    """Dict-like wrapper that persists all conversations to a JSON file.
+
+    Every mutation (create, delete, and explicit ``save()`` calls after nested
+    mutations like message append / rename) writes the full store to disk via
+    an atomic temp-file + replace strategy.
+    """
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._data: dict = {}
+        self._load()
+
+    # -- public dict interface (used by existing route code) ------------------
+
+    def values(self):
+        return self._data.values()
+
+    def __contains__(self, key):
+        return key in self._data
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __setitem__(self, key, value):
+        self._data[key] = value
+        self._save()
+
+    def __delitem__(self, key):
+        del self._data[key]
+        self._save()
+
+    # -- explicit save (for nested mutations that bypass __setitem__) ---------
+
+    def save(self):
+        """Persist after mutating a nested field (e.g. ``conv[\"title\"] = …``)."""
+        self._save()
+
+    # -- internal helpers ----------------------------------------------------
+
+    def _load(self):
+        if self._path.exists():
+            try:
+                self._data = json.loads(self._path.read_text(encoding="utf-8"))
+                logger.info("Loaded %d conversations from %s", len(self._data), self._path)
+            except (json.JSONDecodeError, OSError):
+                logger.error("Failed to load conversations:\n%s", traceback.format_exc())
+                self._data = {}
+        else:
+            logger.info("No saved conversations file, starting empty: %s", self._path)
+
+    def _save(self):
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(self._data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(tmp, self._path)  # atomic on same filesystem
+        except OSError:
+            logger.error("Failed to save conversations:\n%s", traceback.format_exc())
+
+
+conversations = ConversationStore(DATA_FILE)
 
 
 def get_or_create_conv(conv_id: str) -> dict:
@@ -130,7 +240,10 @@ def build_langchain_messages(
 ) -> list:
     """
     Build a list of LangChain message objects suitable for ChatOpenAI.
-    Supports text + image attachments via OpenAI vision format.
+
+    DeepSeek only supports text content blocks (no image_url), so all
+    attachments contribute their extracted ``content`` text appended to
+    the user message.
     """
     lc_messages = []
 
@@ -147,45 +260,25 @@ def build_langchain_messages(
         elif role == "assistant":
             lc_messages.append(AIMessage(content=content))
 
-    # Build the new user message — may include images
-    image_attachments = [
-        a for a in (attachments or [])
-        if a.get("type", "").startswith("image/") and a.get("data_url")
-    ]
-    text_attachments = [
-        a for a in (attachments or [])
-        if not a.get("type", "").startswith("image/")
-    ]
+    # Build the user message — append attachment text content
+    text = new_message
+    if attachments:
+        parts = []
+        for a in attachments:
+            name = a.get("name", "unknown")
+            content = a.get("content", "")
+            a_type = a.get("type", "")
+            if content:
+                if a_type.startswith("image/"):
+                    parts.append(f"[图片: {name}]\n图片内文字：\n{content}")
+                else:
+                    parts.append(f"[文件: {name}]\n{content}")
+            else:
+                parts.append(f"[文件: {name} (无可提取文字)]")
+        if parts:
+            text += "\n\n" + "\n\n".join(parts)
 
-    if image_attachments:
-        # Multimodal message: list of content blocks
-        content_blocks = [{"type": "text", "text": new_message}]
-        for att in image_attachments:
-            content_blocks.append({
-                "type": "image_url",
-                "image_url": {"url": att["data_url"]},
-            })
-        # Append text file contents to the text block
-        if text_attachments:
-            extra = "\n\n".join(
-                f"[文件: {a.get('name', 'unknown')}]\n{a.get('content', '')}"
-                for a in text_attachments if a.get("content")
-            )
-            if extra:
-                content_blocks[0]["text"] += "\n\n" + extra
-        lc_messages.append(HumanMessage(content=content_blocks))
-    else:
-        # Text-only message
-        text = new_message
-        if text_attachments:
-            extra = "\n\n".join(
-                f"[文件: {a.get('name', 'unknown')}]\n{a.get('content', '')}"
-                for a in text_attachments if a.get("content")
-            )
-            if extra:
-                text += "\n\n" + extra
-        lc_messages.append(HumanMessage(content=text))
-
+    lc_messages.append(HumanMessage(content=text))
     return lc_messages
 
 
@@ -229,6 +322,7 @@ async def list_conversations():
 async def create_conversation():
     conv_id = uuid.uuid4().hex[:12]
     conv = get_or_create_conv(conv_id)
+    logger.info("CREATE conv=%s", conv_id)
     return {"id": conv["id"], "title": conv["title"], "created_at": conv["created_at"]}
 
 
@@ -249,6 +343,7 @@ async def get_conversation(conv_id: str):
 async def delete_conversation(conv_id: str):
     if conv_id in conversations:
         del conversations[conv_id]
+        logger.info("DELETE conv=%s", conv_id[:8])
         return {"status": "deleted"}
     raise HTTPException(status_code=404, detail="Conversation not found")
 
@@ -257,6 +352,7 @@ async def delete_conversation(conv_id: str):
 async def rename_conversation(conv_id: str, req: RenameRequest):
     conv = get_or_create_conv(conv_id)
     conv["title"] = req.title
+    conversations.save()
     return {"id": conv_id, "title": req.title}
 
 
@@ -267,12 +363,15 @@ async def update_settings(conv_id: str, model: str = Form(None), mode: str = For
         conv["model"] = model
     if mode and mode in ("quick", "deep"):
         conv["mode"] = mode
+    if model or mode:
+        conversations.save()
     return {"model": conv["model"], "mode": conv["mode"]}
 
 
 # --- File Upload ---
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
+    logger.info("UPLOAD %s (type=%s)", file.filename, file.content_type or "unknown")
     try:
         content = await file.read()
         mime_type = file.content_type or mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
@@ -293,6 +392,37 @@ async def upload_file(file: UploadFile = File(...)):
         if mime_type in ALLOWED_IMAGE_TYPES:
             b64 = base64.b64encode(content).decode("utf-8")
             result["data_url"] = f"data:{mime_type};base64,{b64}"
+            # Extract image dimensions + OCR text (best-effort)
+            try:
+                img = Image.open(io.BytesIO(content))
+                w, h = img.size
+                size_mb = len(content) / (1024 * 1024)
+                meta = f"[图片: {file.filename} | 类型: {mime_type} | 尺寸: {w}x{h} | 大小: {size_mb:.1f}MB]"
+                try:
+                    ocr_text = pytesseract.image_to_string(img, lang="chi_sim+eng")
+                    if ocr_text.strip():
+                        result["content"] = f"{meta}\n图片内文字：\n{ocr_text.strip()[:5000]}"
+                    else:
+                        result["content"] = f"{meta}\n(图中无可识别文字)"
+                except Exception:
+                    logger.warning("Tesseract OCR 未安装 — 图片仅保留元信息，无法提取图中文字。安装: https://github.com/UB-Mannheim/tesseract/wiki")
+                    result["content"] = f"{meta}\n(OCR 未安装，请将图片内容以文字形式描述给我)"
+            except Exception:
+                size_mb = len(content) / (1024 * 1024)
+                result["content"] = f"[图片: {file.filename} | 类型: {mime_type} | 大小: {size_mb:.1f}MB]"
+        elif mime_type == "application/pdf":
+            # Extract text from PDF using pdfplumber
+            try:
+                text_parts = []
+                with pdfplumber.open(io.BytesIO(content)) as pdf:
+                    for page in pdf.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            text_parts.append(page_text)
+                result["content"] = "\n".join(text_parts)[:10000] or "[PDF 无可提取文字]"
+            except Exception:
+                logger.warning("PDF extraction failed for %s:\n%s", file.filename, traceback.format_exc())
+                result["content"] = "[PDF 解析失败]"
         elif mime_type in ALLOWED_TEXT_TYPES or mime_type.startswith("text/"):
             try:
                 result["content"] = content.decode("utf-8")[:10000]
@@ -301,6 +431,7 @@ async def upload_file(file: UploadFile = File(...)):
 
         return result
     except Exception as e:
+        logger.error("Upload failed for %s:\n%s", file.filename, traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -310,6 +441,10 @@ async def chat(conv_id: str, req: ChatRequest):
     conv = get_or_create_conv(conv_id)
     model = req.model or conv.get("model", DEFAULT_MODEL)
     mode = req.mode or conv.get("mode", "quick")
+
+    att_count = len(req.attachments) if req.attachments else 0
+    logger.info("CHAT conv=%s model=%s mode=%s msg_len=%d attachments=%d",
+                conv_id[:8], model, mode, len(req.message), att_count)
 
     if model not in AVAILABLE_MODELS:
         model = DEFAULT_MODEL
@@ -329,10 +464,12 @@ async def chat(conv_id: str, req: ChatRequest):
         "timestamp": datetime.now().isoformat(),
     }
     conv["messages"].append(user_msg)
+    conversations.save()
 
     # Auto-title
     if len(conv["messages"]) == 1 and conv["title"] == "新对话":
         conv["title"] = req.message[:30] + ("..." if len(req.message) > 30 else "")
+        conversations.save()
 
     # Build LangChain messages
     history = conv["messages"][:-1]
@@ -362,6 +499,8 @@ async def chat(conv_id: str, req: ChatRequest):
                     assistant_text += text
                     yield f"data: {json.dumps({'type': 'text', 'text': text})}\n\n"
         except Exception as e:
+            logger.error("LLM streaming error (conv=%s model=%s):\n%s",
+                         conv_id[:8], model, traceback.format_exc())
             error_msg = str(e)
             yield f"data: {json.dumps({'type': 'error', 'text': error_msg})}\n\n"
 
@@ -373,6 +512,7 @@ async def chat(conv_id: str, req: ChatRequest):
             "timestamp": datetime.now().isoformat(),
         }
         conv["messages"].append(assistant_msg)
+        conversations.save()
 
         yield f"data: {json.dumps({'type': 'done', 'message_id': assistant_msg['id']})}\n\n"
 
@@ -397,5 +537,4 @@ if frontend_dir.exists():
 # Entrypoint
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)

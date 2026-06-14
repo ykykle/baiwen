@@ -1,4 +1,7 @@
 .history/
 .env
-backend\__pycache__
-backend\uploads
+backend/__pycache__
+backend/uploads
+backend/data/*.json
+.vscode/
+uploads/

@@ -56,6 +56,7 @@ const Sidebar = {
             console.error('Failed to load conversations:', err);
             this.conversations = [];
             this.render();
+            Utils.toast('加载对话列表失败', 'error');
         }
     },
 

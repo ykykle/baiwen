@@ -85,7 +85,10 @@ const API = {
             method: 'PUT',
             body: formData,
         });
-        if (!res.ok) throw new Error('Failed to update settings');
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || 'Failed to update settings');
+        }
         return res.json();
     },
 
@@ -97,7 +100,10 @@ const API = {
             method: 'POST',
             body: formData,
         });
-        if (!res.ok) throw new Error('Upload failed');
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || 'Upload failed');
+        }
         return res.json();
     },
 
@@ -153,7 +159,7 @@ const API = {
                                     break;
                             }
                         } catch (e) {
-                            // Skip malformed data
+                            console.warn('SSE parse error:', e, 'line:', line.slice(0, 80));
                         }
                     }
                 }
